@@ -1,30 +1,18 @@
-TARGET := test
 CXX ?= g++
-SRC := test.cpp
-OBJ := $(SRC:.cpp=.o)
-DEPS := $(SRC:.cpp=.d)
+CXXFLAGS ?= -std=c++23 -O2 -Wall -Wextra
 
-# tweak as you like
-CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra -Wpedantic -MMD -MP
+all: test bench
 
-all: $(TARGET)
+test: test.cpp alloc.hpp
+	$(CXX) $(CXXFLAGS) test.cpp -o $@
 
-$(TARGET): $(OBJ)
-	$(CXX) $(OBJ) -o $@ $(LDFLAGS)
+bench: bench.cpp alloc.hpp
+	$(CXX) $(CXXFLAGS) -DNDEBUG bench.cpp -o $@
 
-# Rebuild when the header changes; -MMD/-MP also generate precise deps
-%.o: %.cpp alloc.hpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
-
-debug: CXXFLAGS := -std=c++20 -O0 -g3 -Wall -Wextra -Wpedantic -MMD -MP
-debug: clean all
-
-run: $(TARGET)
-	./$(TARGET)
+run: test
+	./test
 
 clean:
-	rm -f $(OBJ) $(DEPS) $(TARGET)
+	rm -f test bench
 
--include $(DEPS)
-
-.PHONY: all debug run clean
+.PHONY: all run clean

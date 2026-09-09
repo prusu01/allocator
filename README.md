@@ -1,100 +1,72 @@
-# my_allocator<T> — Single-Block Object Pool
+# `poolAllocator<T>`
 
-A tiny, header-only object pool that preallocates **one big block** and serves fixed-size **slots** for objects of type `T`. No further system allocations during normal use.
+A fixed-capacity object pool for a single type, header-only. The pool allocates one
+aligned block up front; `allocate()` hands back a slot with a `T` constructed in it and
+`destroy()` runs the destructor and returns the slot. Nothing else reaches the system
+allocator.
 
-> Scope (current): default-constructible `T` only · single-threaded · metadata stored inside freed slots.
+## Design
 
----
+The block is an array of slots. A slot is `max(sizeof(T), sizeof(void *))` bytes aligned to
+`max(alignof(T), alignof(void *))`, so over-aligned types work and the free-list link always
+fits. Unused slots are handed out when needed, and freed slots go onto a LIFO free list
+whose links live inside the freed slots themselves, so the pool needs no extra memory. Objects never move, so a pointer
+stays valid until it is destroyed, the pool is reset, or the pool dies.
 
-## TL;DR
+![slot layout and free list](diagram.png)
 
-- **One allocation up front**
-- **O(1) allocate / O(1) destroy**
-- **Type-agnostic** (parametric polymorphism via templates)
-- **Cache-friendly** reuse of recently freed slots
+A capacity-8 pool after five allocations and two frees. Green slots hold live objects, orange
+slots are on the free list, grey slots have never been handed out. The free-list links live
+inside the freed slots.
 
----
+## Interface
 
-## What you get
+```cpp
+poolAllocator<T> pool(1024); // one aligned block, capacity 1024
 
-- Deterministic performance: only the constructor touches the system allocator  
-- Stable pointers: an object’s address remains valid until you destroy it  
-- Minimal overhead: no external containers; free-list pointers live inside freed slots
+T *p = pool.allocate(args...);// forwards args to T's constructor, nullptr when full
 
----
+pool.destroy(p);            // ~T(), slot goes back on the free list
+pool.reset();               // destroys every live object, rewinds to empty
 
-## Interface (no code)
+pool.size();                // live objects
+pool.capacity();            // slots in the block
+```
 
-- **Constructor** — `my_allocator<T>(nb)`  
-  Creates a pool with capacity for `nb` objects of type `T`. Performs the single, large allocation.
+`allocate()` with no arguments value-initialises. The pool is movable and not copyable; a
+moved-from pool is empty (capacity 0) and still usable.
 
-- **`allocate() → T*`**  
-  Returns a pointer to a default-constructed `T` from the pool.  
-  Returns `nullptr` if the pool is full. Amortized O(1).
+## Benchmark
 
-- **`destroy(T* p)`**  
-  Calls `~T()` and returns the slot to the pool’s free list.  
-  Undefined behavior if `p` did not come from this pool, was already destroyed, or is `nullptr`.
+![benchmark results](chart.png)
 
-- **`get_object_nb() → int`**  
-  The number of **live** objects currently managed by the pool.
+| scenario | poolAllocator | new/delete | std::allocator |
+| --- | --- | --- | --- |
+| random-order free + alloc (ns/pair) | 27.47 | 100.98 | 78.36 |
+| memory (bytes/object) | 32.0 | 48.0 | 48.0 |
 
----
 
-## How it works (in words)
+**System**: 13th Gen Intel Core i7-13700H, WSL2 on Windows, g++ 11.4.0, `-O2 -std=c++20 -DNDEBUG`.
 
-- The pool holds an array of **slots**; each slot is a tiny union that stores either a pointer to the **next free slot** or a live `T`.  
-- **Allocation** prefers the **free list** (pop a slot). If empty, it hands out the next **never-used** slot via a bump pointer. If neither is available, `allocate()` returns `nullptr`.  
-- **Destruction** calls the object’s destructor and **pushes** the slot back onto the free list.  
-- Because metadata lives *inside* freed slots, there is **zero extra memory** beyond the single big block.
+Best of 5 timed runs after one warm-up. The object is a 32-byte POD. The scenario keeps
+1,000,000 objects live and walks a shuffled index sequence in batches of 64 frees followed by
+64 allocations, so the free list has real depth and the addresses are scattered. Run it with
+`make bench && ./bench`, and redraw the chart with `./bench | python3 chart.py`.
 
----
+To measure the memory performance, the benchmark snapshots glibc's `mallinfo2`
+before and after building a million objects. The pool needs one slot per object and keeps no
+per-object metadata, while glibc adds an eight-byte header to every chunk and rounds the
+result up to a multiple of sixteen, so a 32-byte object costs 48 bytes there..
 
-## Guarantees
+## Limitations
 
-- Exactly **one** system allocation in the constructor  
-- **O(1)** `allocate()` and `destroy()`  
-- **No fragmentation** (fixed-size slots)  
-- **Predictable reuse** (LIFO free-list by default)
-
----
-
-## Safety & assumptions
-
-- Default-constructible `T` only (current version)  
-- **Ownership**: only pass pointers returned by this pool to `destroy()`; don’t mix across pools  
-- **Lifecycle**: destroy all live objects before destroying the pool (no automatic sweep)  
-- **Threading**: not thread-safe  
-- **Alignment**: base version uses `malloc` (aligned to `std::max_align_t`). For over-aligned `T` (e.g., `alignas(64)`), switch to aligned allocation.
-
----
-
-## Common mistakes to avoid
-
-- Double-destroy or destroying a foreign pointer → undefined behavior  
-- Using a pointer after `destroy()`  
-- Assuming constructor arguments are supported (see “Extensions”)
-
----
-
-## Extensions you may add
-
-- Constructor forwarding: `allocate(Args&&…)` to support any `T` constructor  
-- Aligned allocation with `operator new[]` + `std::align_val_t` for over-aligned `T`  
-- `reset()` to destroy all live objects and rewind the pool  
-- Stats: `capacity()`, `free_slots()`, high-water mark  
-- Debug mode: optional range checks / double-free detection
-
----
-
-## Glossary
-
-- **Parametric polymorphism (generics)**: the allocator works for any `T` via templates  
-- **Placement construction / explicit destruction**: build and tear down objects in pre-allocated storage  
-- **Free list**: a simple list of freed slots stored inside the slots themselves
-
----
-
-## License
-
-Pick a permissive license (MIT/BSD/Apache-2.0) and add a `LICENSE` file. Contributions welcome.
+- Not thread-safe. No locks, no atomics: use one pool per thread.
+- Fixed capacity. `allocate()` returns `nullptr` when the block is full and the pool never
+  grows.
+- The destructor frees the block without destroying live objects. Call `reset()` first if
+  `~T()` has to run.
+- `destroy()` trusts the caller. The "came from this pool" check is an `assert`, so it is
+  gone under `NDEBUG`, and double frees are not detected at all.
+- `allocate()` is `noexcept`. A throwing `T` constructor terminates the program.
+- `reset()` tells live slots from freed ones by walking the free list, so it costs
+  O(live x freed), or O(live) when nothing was freed individually. 

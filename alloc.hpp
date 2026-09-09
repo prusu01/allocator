@@ -1,85 +1,125 @@
-#include <bits/stdc++.h>
+#pragma once
 
-
-using namespace std;
-#define add_to_p(P, L) P = (void *)((char *)P + L)
+#include <cassert>
+#include <cstddef>
+#include <new>
+#include <utility>
 
 template <class T>
-class my_allocator{
+class poolAllocator{
 private:
-    int objs;
-    
+    std::size_t objectCount;
 
-    union slot{
-        slot *next; //next free block if this is free, null by default
-        T data;
+    static constexpr std::size_t slotSize =
+        sizeof(T) > sizeof(void *) ? sizeof(T) : sizeof(void *);
+    static constexpr std::size_t slotAlign =
+        alignof(T) > alignof(void *) ? alignof(T) : alignof(void *);
+
+    struct alignas(slotAlign) slot{
+        unsigned char storage[slotSize];
     };
-    slot* memory;
-    slot *next_unbuilt;
-    slot *head_freed;
-    slot *end;
+
+    // A free slot keeps the next free-list link in the bytes a live T would occupy.
+    static slot *&nextFreeLink(slot *freeSlot) noexcept{
+        return *reinterpret_cast<slot **>(freeSlot->storage);
+    }
+
+    bool isSlotInFreeList(const slot *wanted) const noexcept{
+        for(slot *node = freeListHead; node; node = nextFreeLink(node)){
+            if(node == wanted){
+                return true;
+            }
+        }
+        return false;
+    }
+
+    slot *blockStart;
+    slot *nextUnbuilt;
+    slot *freeListHead;
+    slot *blockEnd;
 
 public:
-    my_allocator(int nb){
-        size_t size  = nb * sizeof(slot);
-        next_unbuilt = (slot *)malloc(size);
-        memory = next_unbuilt;
-        end = next_unbuilt + nb;
-        objs = 0;
-        head_freed = nullptr;
+    explicit poolAllocator(std::size_t slotCount) noexcept{
+        blockStart = new (std::nothrow) slot[slotCount];
+        nextUnbuilt = blockStart;
+        blockEnd = blockStart + (blockStart ? slotCount : 0);
+        objectCount = 0;
+        freeListHead = nullptr;
     }
 
-    ~my_allocator(){
-        free(memory);
+    ~poolAllocator() noexcept{
+        delete[] blockStart;
     }
 
-    T * allocate(){
-        cout<<"allocate"<<endl;
-        slot *to_use = nullptr;
+    poolAllocator(const poolAllocator &) = delete;
+    poolAllocator &operator=(const poolAllocator &) = delete;
 
-        if(head_freed){
-            to_use = head_freed;
-            head_freed = head_freed->next; 
+    poolAllocator(poolAllocator &&other) noexcept
+        : objectCount(other.objectCount), blockStart(other.blockStart),
+          nextUnbuilt(other.nextUnbuilt), freeListHead(other.freeListHead),
+          blockEnd(other.blockEnd){
+        other.blockStart = other.nextUnbuilt = other.freeListHead = other.blockEnd = nullptr;
+        other.objectCount = 0;
+    }
+
+    poolAllocator &operator=(poolAllocator &&other) noexcept{
+        poolAllocator tmp(std::move(other));
+        std::swap(objectCount, tmp.objectCount);
+        std::swap(blockStart, tmp.blockStart);
+        std::swap(nextUnbuilt, tmp.nextUnbuilt);
+        std::swap(freeListHead, tmp.freeListHead);
+        std::swap(blockEnd, tmp.blockEnd);
+        return *this;
+    }
+
+    template <class... Args>
+    T *allocate(Args &&...args) noexcept{
+        slot *chosenSlot = nullptr;
+
+        if(freeListHead){
+            chosenSlot = freeListHead;
+            freeListHead = nextFreeLink(freeListHead);
         }
-        else if(next_unbuilt < end){
-            to_use = next_unbuilt;
-            next_unbuilt++;
+        else if(nextUnbuilt < blockEnd){
+            chosenSlot = nextUnbuilt;
+            nextUnbuilt++;
         }
         else{
-            cout<<"full"<<endl;
             return nullptr;
         }
 
-        T *obj = new(static_cast<void*>(&to_use->data))T();
-        objs++;
+        T *obj = ::new(static_cast<void *>(chosenSlot->storage)) T(std::forward<Args>(args)...);
+        objectCount++;
         return obj;
     }
 
-    void destroy(T * obj){
-        cout<<"destroy"<<endl;
-        slot *recvd = reinterpret_cast<slot*>(obj);
-        if(recvd < memory || recvd>= next_unbuilt){
-            cout<<"memory from other pool"<<endl;
-            return;
-        }
+    void destroy(T *obj) noexcept{
+        slot *receivedSlot = reinterpret_cast<slot *>(obj);
+        assert(receivedSlot >= blockStart && receivedSlot < nextUnbuilt
+               && "pointer is not from this pool");
 
         obj->~T();
-        objs --;
-
-        
-        recvd->next = nullptr;
-        if(!head_freed){
-            head_freed = recvd;
-        }
-        else{
-            recvd->next = head_freed;
-            head_freed = recvd;
-        }
-
+        nextFreeLink(receivedSlot) = freeListHead;
+        freeListHead = receivedSlot;
+        objectCount--;
     }
 
-    int get_object_nb(){
-        return objs;
+    void reset() noexcept{
+        for(slot *current = blockStart; current < nextUnbuilt; current++){
+            if(!isSlotInFreeList(current)){
+                std::launder(reinterpret_cast<T *>(current->storage))->~T();
+            }
+        }
+        nextUnbuilt = blockStart;
+        freeListHead = nullptr;
+        objectCount = 0;
     }
 
+    std::size_t size() const noexcept{
+        return objectCount;
+    }
+
+    std::size_t capacity() const noexcept{
+        return static_cast<std::size_t>(blockEnd - blockStart);
+    }
 };
